@@ -22,7 +22,10 @@ require (
 	golang.zx2c4.com/wireguard v0.0.0-20231211153847-12269c276173 // indirect
 )
 
-require golang.org/x/exp v0.0.0-20240325151524-a685a6edb6d8
+require (
+	golang.org/x/exp v0.0.0-20240325151524-a685a6edb6d8
+	gvisor.dev/gvisor v0.0.0-20230927004350-cbd86285d259
+)
 
 require (
 	filippo.io/edwards25519 v1.0.0-rc.1.0.20210721174708-390f27c3be20 // indirect
@@ -67,5 +70,4 @@ require (
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	gotest.tools/v3 v3.4.0 // indirect
 )

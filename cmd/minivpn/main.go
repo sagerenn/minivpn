@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/Doridian/water"
@@ -19,6 +20,7 @@ import (
 	"github.com/ooni/minivpn/pkg/config"
 	"github.com/ooni/minivpn/pkg/tracex"
 	"github.com/ooni/minivpn/pkg/tunnel"
+	"github.com/ooni/minivpn/pkg/userspace"
 )
 
 func runCmd(binaryPath string, args ...string) {
@@ -40,12 +42,50 @@ func runRoute(args ...string) {
 	runCmd("/sbin/route", args...)
 }
 
+func resolveRemoteWithCustomDNS(ctx context.Context, cfg *cmdConfig, vpncfg *config.Config) error {
+	if cfg.remoteDNS == "" {
+		return nil
+	}
+	remoteHost := vpncfg.OpenVPNOptions().Remote
+	if remoteHost == "" {
+		return fmt.Errorf("remote host not configured")
+	}
+	if net.ParseIP(remoteHost) != nil {
+		return nil
+	}
+	targetDNS := cfg.remoteDNS
+	if !strings.Contains(targetDNS, ":") {
+		targetDNS = net.JoinHostPort(targetDNS, "53")
+	}
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, targetDNS)
+		},
+	}
+	ips, err := resolver.LookupIP(ctx, "ip4", remoteHost)
+	if err != nil {
+		return fmt.Errorf("lookup %s via %s: %w", remoteHost, targetDNS, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("lookup %s via %s returned no IPv4 addresses", remoteHost, targetDNS)
+	}
+	resolved := ips[0].String()
+	vpncfg.Logger().Infof("remote host %s resolved to %s via %s", remoteHost, resolved, targetDNS)
+	vpncfg.OpenVPNOptions().Remote = resolved
+	return nil
+}
+
 type cmdConfig struct {
-	configPath string
-	doPing     bool
-	doTrace    bool
-	skipRoute  bool
-	timeout    int
+	configPath     string
+	doPing         bool
+	doTrace        bool
+	skipRoute      bool
+	userspace      bool
+	userspaceSocks string
+	remoteDNS      string
+	timeout        int
 }
 
 func main() {
@@ -56,11 +96,26 @@ func main() {
 	flag.BoolVar(&cfg.doPing, "ping", false, "if true, do ping and exit (for testing)")
 	flag.BoolVar(&cfg.doTrace, "trace", false, "if true, do a trace of the handshake and exit (for testing)")
 	flag.BoolVar(&cfg.skipRoute, "skip-route", false, "if true, exit without setting routes (for testing)")
+	flag.BoolVar(&cfg.userspace, "userspace", false, "use the gVisor stack instead of the kernel TUN device")
+	flag.StringVar(&cfg.userspaceSocks, "userspace-socks", "", "SOCKS5 listen address for --userspace (e.g. 127.0.0.1:1080)")
+	flag.StringVar(&cfg.remoteDNS, "remote-dns", "", "resolve remote hostnames using this DNS server (ip[:port]) before connecting")
 	flag.IntVar(&cfg.timeout, "timeout", 60, "timeout in seconds (default=60)")
 	flag.Parse()
 
 	if cfg.configPath == "" {
 		fmt.Println("[error] need config path")
+		os.Exit(1)
+	}
+	if cfg.userspaceSocks != "" && !cfg.userspace {
+		fmt.Println("[error] --userspace-socks requires --userspace")
+		os.Exit(1)
+	}
+	if cfg.userspace && cfg.doPing {
+		fmt.Println("[error] --ping cannot be combined with --userspace")
+		os.Exit(1)
+	}
+	if cfg.userspace && cfg.skipRoute {
+		fmt.Println("[error] --skip-route cannot be combined with --userspace")
 		os.Exit(1)
 	}
 
@@ -95,6 +150,9 @@ func main() {
 
 	// create config from the passed options
 	vpncfg := config.NewConfig(opts...)
+	if err := resolveRemoteWithCustomDNS(ctx, cfg, vpncfg); err != nil {
+		log.WithError(err).Fatal("remote DNS resolution failed")
+	}
 
 	// create a vpn tun Device
 	tun, err := tunnel.Start(ctx, &net.Dialer{}, vpncfg)
@@ -109,6 +167,13 @@ func main() {
 	fmt.Printf("elapsed: %v\n", time.Since(start))
 
 	if cfg.doTrace {
+		return
+	}
+
+	if cfg.userspace {
+		if err := runUserspaceMode(cfg, vpncfg, tun); err != nil {
+			log.WithError(err).Fatal("userspace mode error")
+		}
 		return
 	}
 
@@ -195,4 +260,38 @@ func main() {
 		}
 	}()
 	select {}
+}
+
+func runUserspaceMode(cfg *cmdConfig, vpncfg *config.Config, tunConn *tunnel.TUN) error {
+	localIP := net.ParseIP(tunConn.LocalAddr().String())
+	if localIP == nil {
+		return fmt.Errorf("userspace: invalid local address %s", tunConn.LocalAddr())
+	}
+	remoteIP := net.ParseIP(tunConn.RemoteAddr().String())
+	if remoteIP == nil {
+		return fmt.Errorf("userspace: invalid gateway address %s", tunConn.RemoteAddr())
+	}
+	stackCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stack, err := userspace.New(stackCtx, vpncfg.Logger(), tunConn, localIP, remoteIP, tunConn.NetMask())
+	if err != nil {
+		return err
+	}
+	defer stack.Close()
+
+	if cfg.userspaceSocks != "" {
+		go func() {
+			if err := stack.ServeSOCKS(stackCtx, cfg.userspaceSocks); err != nil {
+				log.WithError(err).Warn("userspace SOCKS server stopped")
+			}
+		}()
+		log.Infof("SOCKS5 proxy listening on %s", cfg.userspaceSocks)
+	} else {
+		log.Warn("userspace stack active without SOCKS proxy; set --userspace-socks to expose it")
+	}
+
+	log.Info("userspace stack ready; press Ctrl+C to exit")
+	<-stack.Done()
+	return fmt.Errorf("userspace stack terminated")
 }
